@@ -38,6 +38,15 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+struct FreeListGuard<'a>(&'a AtomicBool);
+
+impl Drop for FreeListGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Free block header, stored at the beginning of each free memory block
 struct FreeBlock {
@@ -50,6 +59,7 @@ pub struct FreeListAllocator {
     heap_end: usize,
     /// Bump pointer: unallocated region starts here
     bump_next: core::sync::atomic::AtomicUsize,
+    free_list_lock: AtomicBool,
     /// Free list head (protected by Mutex in test, UnsafeCell otherwise)
     #[cfg(test)]
     free_list: std::sync::Mutex<*mut FreeBlock>,
@@ -74,11 +84,23 @@ impl FreeListAllocator {
             heap_start,
             heap_end,
             bump_next: core::sync::atomic::AtomicUsize::new(heap_start),
+            free_list_lock: AtomicBool::new(false),
             #[cfg(test)]
             free_list: std::sync::Mutex::new(null_mut()),
             #[cfg(not(test))]
             free_list: core::cell::UnsafeCell::new(null_mut()),
         }
+    }
+
+    fn lock(&self) -> FreeListGuard<'_> {
+        while self
+            .free_list_lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        FreeListGuard(&self.free_list_lock)
     }
 
     #[cfg(test)]
@@ -104,6 +126,7 @@ impl FreeListAllocator {
 
 unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _guard = self.lock();
         // Ensure block is at least large enough to hold a FreeBlock header (for future dealloc)
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
@@ -119,10 +142,39 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // TODO: Step 2 — no suitable block in free_list, allocate from bump region
         //
         // Same logic as 02_bump_allocator's alloc
-        todo!()
+        let mut previous: *mut FreeBlock = null_mut();
+        let mut current = self.free_list_head();
+        while !current.is_null() {
+            if current as usize % align == 0 && (*current).size >= size {
+                if previous.is_null() {
+                    self.set_free_list_head((*current).next);
+                } else {
+                    (*previous).next = (*current).next;
+                }
+                return current.cast();
+            }
+            previous = current;
+            current = (*current).next;
+        }
+        let next = self.bump_next.load(Ordering::Relaxed);
+        let Some(aligned) = next
+            .checked_add(align - 1)
+            .map(|address| address & !(align - 1))
+        else {
+            return null_mut();
+        };
+        let Some(end) = aligned.checked_add(size) else {
+            return null_mut();
+        };
+        if aligned < self.heap_start || end > self.heap_end {
+            return null_mut();
+        }
+        self.bump_next.store(end, Ordering::Relaxed);
+        aligned as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _guard = self.lock();
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
 
         // TODO: Insert the freed block at the head of free_list
@@ -131,7 +183,12 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // 1. Cast ptr to *mut FreeBlock
         // 2. Write FreeBlock { size, next: current list head }
         // 3. Update free_list head to ptr
-        todo!()
+        let block = ptr.cast::<FreeBlock>();
+        block.write(FreeBlock {
+            size,
+            next: self.free_list_head(),
+        });
+        self.set_free_list_head(block);
     }
 }
 
@@ -141,6 +198,47 @@ unsafe impl GlobalAlloc for FreeListAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_first_fit_skips_small_block() {
+        let (allocator, _heap) = make_allocator();
+        let small = Layout::from_size_align(32, 8).unwrap();
+        let large = Layout::from_size_align(128, 8).unwrap();
+        unsafe {
+            let large_pointer = allocator.alloc(large);
+            let small_pointer = allocator.alloc(small);
+            assert!(!large_pointer.is_null() && !small_pointer.is_null());
+            allocator.dealloc(large_pointer, large);
+            allocator.dealloc(small_pointer, small);
+            assert_eq!(allocator.alloc(large), large_pointer);
+            assert_eq!(allocator.alloc(small), small_pointer);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_alloc_and_dealloc() {
+        let (allocator, _heap) = make_allocator();
+        let layout = Layout::from_size_align(32, 8).unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let allocator = &allocator;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        unsafe {
+                            let pointer = allocator.alloc(layout);
+                            assert!(!pointer.is_null());
+                            pointer.write_bytes(worker, layout.size());
+                            std::thread::yield_now();
+                            for offset in 0..layout.size() {
+                                assert_eq!(pointer.add(offset).read(), worker);
+                            }
+                            allocator.dealloc(pointer, layout);
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     const HEAP_SIZE: usize = 4096;
 

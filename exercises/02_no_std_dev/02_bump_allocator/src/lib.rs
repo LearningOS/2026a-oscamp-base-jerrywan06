@@ -74,7 +74,28 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // 5. Atomically update next to end using compare_exchange
         //    (if CAS fails, another thread raced — retry in a loop)
         // 6. Return the aligned address as a pointer
-        todo!()
+        let mut next = self.next.load(Ordering::SeqCst);
+        loop {
+            let Some(aligned) = next
+                .checked_add(layout.align() - 1)
+                .map(|address| address & !(layout.align() - 1))
+            else {
+                return null_mut();
+            };
+            let Some(end) = aligned.checked_add(layout.size()) else {
+                return null_mut();
+            };
+            if end > self.heap_end {
+                return null_mut();
+            }
+            match self
+                .next
+                .compare_exchange(next, end, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return aligned as *mut u8,
+                Err(current) => next = current,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
@@ -88,6 +109,37 @@ unsafe impl GlobalAlloc for BumpAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_concurrent_allocations_do_not_overlap() {
+        let (allocator, _heap) = make_allocator();
+        let layout = Layout::from_size_align(8, 8).unwrap();
+        let mut addresses = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let allocator = &allocator;
+                    scope.spawn(move || {
+                        (0..32)
+                            .map(|_| {
+                                let pointer = unsafe { allocator.alloc(layout) };
+                                assert!(!pointer.is_null());
+                                assert_eq!(pointer as usize % layout.align(), 0);
+                                pointer as usize
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        addresses.sort_unstable();
+        assert!(addresses
+            .windows(2)
+            .all(|pair| pair[0] + layout.size() <= pair[1]));
+    }
 
     const HEAP_SIZE: usize = 4096;
 
