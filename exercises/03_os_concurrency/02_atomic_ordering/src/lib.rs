@@ -33,28 +33,20 @@ impl FlagChannel {
     }
 
     /// Producer: store data first, then set ready flag.
-    ///
-    /// TODO: Choose correct Ordering
-    /// - What Ordering should be used for writing data?
-    /// - What Ordering should be used for writing ready? (ensuring data writes are visible to consumer)
     pub fn produce(&self, value: u32) {
-        // TODO: Store data (choose appropriate Ordering)
-        // TODO: Set ready = true (choose appropriate Ordering so data writes complete before this)
-        todo!()
+        self.data.store(value, Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
     }
 
     /// Consumer: spin-wait for ready flag, then read data.
-    ///
-    /// TODO: Choose correct Ordering
-    /// - What Ordering should be used for reading ready? (ensuring it sees data writes from produce)
-    /// - What Ordering should be used for reading data?
     pub fn consume(&self) -> u32 {
-        // TODO: Spin-wait for ready to become true (choose appropriate Ordering)
-        // TODO: Read data (choose appropriate Ordering)
-        todo!()
+        while !self.ready.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        self.data.load(Ordering::Relaxed)
     }
 
-    /// Reset channel state
+    /// Reset channel state after all producers and consumers have finished.
     pub fn reset(&self) {
         self.ready.store(false, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
@@ -64,6 +56,7 @@ impl FlagChannel {
 /// A simple once-initializer using SeqCst.
 /// Guarantees `init` is executed only once, and all threads see the initialized value.
 pub struct OnceCell {
+    initializing: AtomicBool,
     initialized: AtomicBool,
     value: AtomicU32,
 }
@@ -71,6 +64,7 @@ pub struct OnceCell {
 impl OnceCell {
     pub const fn new() -> Self {
         Self {
+            initializing: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             value: AtomicU32::new(0),
         }
@@ -81,15 +75,26 @@ impl OnceCell {
     ///
     /// Hint: use `compare_exchange` to ensure only one thread succeeds.
     pub fn init(&self, val: u32) -> bool {
-        // TODO: Use compare_exchange to ensure initialization only once
-        // Store value on success
-        todo!()
+        if self
+            .initializing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        // Claim initialization separately so readers cannot see an unpublished value.
+        self.value.store(val, Ordering::SeqCst);
+        self.initialized.store(true, Ordering::SeqCst);
+        true
     }
 
     /// Get value. Returns Some if initialized, otherwise None.
     pub fn get(&self) -> Option<u32> {
-        // TODO: Check initialized flag, then read value
-        todo!()
+        if self.initialized.load(Ordering::SeqCst) {
+            Some(self.value.load(Ordering::SeqCst))
+        } else {
+            None
+        }
     }
 }
 
@@ -157,5 +162,37 @@ mod tests {
         // Exactly one thread initializes successfully
         assert_eq!(results.iter().filter(|&&r| r).count(), 1);
         assert!(cell.get().is_some());
+    }
+
+    #[test]
+    fn test_once_cell_publishes_winning_value() {
+        for _ in 0..16 {
+            let cell = Arc::new(OnceCell::new());
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let mut handles = vec![];
+            for value in 1..=8 {
+                let cell = Arc::clone(&cell);
+                let barrier = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let initialized = cell.init(value);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let observed = loop {
+                        if let Some(value) = cell.get() {
+                            break value;
+                        }
+                        assert!(std::time::Instant::now() < deadline);
+                        thread::yield_now();
+                    };
+                    (initialized.then_some(value), observed)
+                }));
+            }
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners: Vec<_> = results.iter().filter_map(|&(winner, _)| winner).collect();
+            assert_eq!(winners.len(), 1);
+            for (_, observed) in results {
+                assert_eq!(observed, winners[0]);
+            }
+        }
     }
 }

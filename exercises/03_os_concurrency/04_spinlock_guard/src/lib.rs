@@ -10,6 +10,7 @@
 //! - Why manual lock/unlock is unsafe (forgetting unlock, panic without release)
 
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,8 +24,22 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 
 /// Spin lock guard: RAII handle holding the lock.
 /// Automatically releases the lock when SpinGuard is dropped.
+/// Sharing a guard requires its data to be `Sync`.
+///
+/// ```compile_fail
+/// use spinlock_guard::SpinLock;
+/// use std::cell::Cell;
+/// let lock = SpinLock::new(Cell::new(0));
+/// let guard = lock.lock();
+/// std::thread::scope(|scope| {
+///     let shared = &guard;
+///     scope.spawn(move || shared.set(1));
+/// });
+/// ```
 pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    // A shared guard must not expose a non-Sync T to multiple threads.
+    marker: PhantomData<&'a mut T>,
 }
 
 impl<T> SpinLock<T> {
@@ -36,38 +51,39 @@ impl<T> SpinLock<T> {
     }
 
     /// Acquire lock, returning SpinGuard.
-    ///
-    /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuard {
+            lock: self,
+            marker: PhantomData,
+        }
     }
 }
 
-// TODO: Implement Deref trait for SpinGuard
-// Return &T, obtained via self.lock.data.get()
 impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // The guard holds exclusive access for the lifetime of this reference.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
-// TODO: Implement DerefMut trait for SpinGuard
-// Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
-// TODO: Implement Drop trait for SpinGuard
-// Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 
@@ -148,6 +164,6 @@ mod tests {
 
         assert!(result.is_err());
         // Even if thread panics, guard's Drop should release lock
-        // Note: this test may have different results due to panic unwind behavior
+        assert_eq!(*lock.lock(), 42);
     }
 }
